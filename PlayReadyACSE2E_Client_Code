@@ -1,0 +1,132 @@
+public string GetAcsToken()
+        {
+            string issuer   = System.Configuration.ConfigurationManager.AppSettings["AcsIssuer"];
+            string scope    = System.Configuration.ConfigurationManager.AppSettings["AcsScope"];
+            string username = System.Configuration.ConfigurationManager.AppSettings["Username"];
+            string password = System.Configuration.ConfigurationManager.AppSettings["Password"];
+            
+            string tokenToReturn = null;
+
+            using (WebClient client = new WebClient())
+            {
+                //
+                //  Create the authentication request to get a token
+                //
+                client.BaseAddress = (new Uri(issuer)).AbsoluteUri;
+
+                var oauthRequestValues = new NameValueCollection
+                {
+                    {"grant_type",    "client_credentials"},
+                    {"client_id",     username},
+                    {"client_secret", password},
+                    {"scope",         scope},
+                };
+
+                byte[] responseBytes = null;
+
+                try
+                {
+                    responseBytes = client.UploadValues("/v2/OAuth2-13", "POST", oauthRequestValues);
+                }
+                catch (WebException we)
+                {
+                    Stream stream = we.Response.GetResponseStream();
+                    StreamReader reader = new StreamReader(stream);
+
+                    throw;
+                }
+
+                using (var responseStream = new MemoryStream(responseBytes))
+                {
+                    OAuth2TokenResponse tokenResponse = (OAuth2TokenResponse)new DataContractJsonSerializer(typeof(OAuth2TokenResponse)).ReadObject(responseStream);
+                    tokenToReturn = tokenResponse.AccessToken;
+                }
+            }
+
+            return tokenToReturn;
+        }
+
+
+
+using System;
+using System.Net;
+using System.Windows.Media;
+using System.IO;
+
+namespace SmoothStreamingPlayer
+{
+    public class CustomLicenseAcquirer : LicenseAcquirer
+    {
+        private string challengeString;  //hold licenseChallenge string 
+
+        // called before MediaOpened is raised, and when the Media pipeline is building a topology
+        protected override void OnAcquireLicense(Stream licenseChallenge, Uri licenseServerUri)
+        {
+            StreamReader objStreamReader = new StreamReader(licenseChallenge);
+            challengeString = objStreamReader.ReadToEnd();
+
+            // set License Server URL, based on whether there is an override
+            Uri resolvedLicenseServerUri;
+            if (LicenseServerUriOverride == null)
+                resolvedLicenseServerUri = licenseServerUri;
+            else
+                resolvedLicenseServerUri = LicenseServerUriOverride;
+
+            //SMFPlayer bug: converting & to &amp; in query string parameters. This line fixes it.
+            resolvedLicenseServerUri = new Uri(System.Windows.Browser.HttpUtility.HtmlDecode(resolvedLicenseServerUri.AbsoluteUri));
+            
+            //construct HttpWebRequest to license server
+            HttpWebRequest objHttpWebRequest = WebRequest.Create(resolvedLicenseServerUri) as HttpWebRequest;
+            objHttpWebRequest.Method = "POST";
+            objHttpWebRequest.ContentType = "application/xml";
+            //The headers below are necessary so that error handling and redirects are handled properly via the Silverlight client.
+            objHttpWebRequest.Headers["msprdrm_server_redirect_compat"]  = "false";
+            objHttpWebRequest.Headers["msprdrm_server_exception_compat"] = "false";
+
+            //for testing ContentKeyRestrictionType.TokenRestricted
+            //  To retrieve ACS Token, the following codes are used:
+            //- WCFService.svc GetAcsToken()
+            //- MainPage.xaml.cs button_Click
+            //- CustomLicenseAcquirer.cs OnAcquireLicense
+            //- Constants.AcsToken
+            if (Constants.AddAuthorizationToken)
+            {
+                //string kid   = Constants.KeyId;   //"42b3ddc1-2b93-4813-b50b-af1ec3c9c771";
+                objHttpWebRequest.Headers["Authorization"] = "Bearer=" + Constants.AcsToken;  
+            }
+
+            //  Initiate getting request stream  
+            IAsyncResult objIAsyncResult = objHttpWebRequest.BeginGetRequestStream(new AsyncCallback(RequestStreamCallback), objHttpWebRequest);
+        }
+
+        // This method is called when the asynchronous operation completes.
+        void RequestStreamCallback(IAsyncResult ar)
+        {
+            HttpWebRequest objHttpWebRequest = ar.AsyncState as HttpWebRequest;  
+            objHttpWebRequest.ContentType = "text/xml";
+            //add challengeString to HttpWebRequest
+            Stream objStream = objHttpWebRequest.EndGetRequestStream(ar);
+            StreamWriter objStreamWriter = new StreamWriter(objStream, System.Text.Encoding.UTF8);
+            objStreamWriter.Write(challengeString);
+            objStreamWriter.Close();
+
+            // Make async call for response  
+            objHttpWebRequest.BeginGetResponse(new AsyncCallback(ResponseCallback), objHttpWebRequest);
+        }
+
+        private void ResponseCallback(IAsyncResult ar)
+        {
+            HttpWebRequest objHttpWebRequest = ar.AsyncState as HttpWebRequest;
+            WebResponse objWebResponse = objHttpWebRequest.EndGetResponse(ar);       
+            Stream objStream = objWebResponse.GetResponseStream(); 
+
+            //get license body        
+            //StreamReader objStreamReader = new StreamReader(objStream, System.Text.Encoding.UTF8);
+            //string prLicense = objStreamReader.ReadToEnd();
+
+            //objStream.Seek(0, SeekOrigin.Begin);
+            SetLicenseResponse(objStream);
+        }
+
+    }  //class
+}  //namespace

@@ -1,0 +1,120 @@
+public static void SetupDynamicPlayReadyProtection(CloudMediaContext objCloudMediaContext, IAsset objIAsset)
+        {
+            string keySeedB64, contentKeyB64;
+            Guid keyId = Guid.NewGuid();
+            //Different ways to create content key:
+            //Method 1: Without using key seed, generete content key directly
+            //contentKeyB64 = GeneratePlayReadyContentKey();
+            //Method 2: With a given key seed and generated key ID (Key Identifiers are unique in the system and there can only be one key with a given Guid within a cluster (even across accounts for now although that may change to be account scoped in the future).  If you try to submit a protection job with a keyId that already exists but a different key value that will cause the PlayReady protection job to fail (the same keyId and keyValue is okay). 
+            keySeedB64 = "XVBovsmzhP9gRIZxWfFta3VVRPzVEWmJsazEJ46I";
+            contentKeyB64 = GetPlayReadyContentKeyFromKeyIdKeySeed(keyId.ToString(), keySeedB64);
+            //Method 3: With a randomly generated key seed, create content key from the key ID and key seed
+            //keySeedB64 = GeneratePlayReadyKeySeed();
+            //contentKeyB64 = GetPlayReadyContentKeyFromKeyIdKeySeed(keyId.ToString(), keySeedB64);
+            //Method 4: Reuse an existing key ID
+            //keyId = new Guid("a7586184-40ff-4047-9edd-6a8273ac50fc");
+            //keySeedB64 = "XVBovsmzhP9gRIZxWfFta3VVRPzVEWmJsazEJ46I";
+            //contentKeyB64 = GetPlayReadyContentKeyFromKeyIdKeySeed(keyId.ToString(), keySeedB64);
+            Console.WriteLine(string.Format("STEP 1: Key ID = {0}, Content Key = {1}, Key Seed = {2}", contentKeyB64, keyId.ToString(), keySeedB64));
+
+            IContentKey objIContentKey = ConfigureKeyDeliveryService(objCloudMediaContext, keyId, contentKeyB64);
+
+            //associate IAsset with the IContentkey
+            objIAsset.ContentKeys.Add(objIContentKey);
+            CreateAssetDeliveryPolicy(objCloudMediaContext, objIAsset, objIContentKey);
+        }
+
+public static IContentKey ConfigureKeyDeliveryService(CloudMediaContext objCloudMediaContext, Guid keyId, string contentKeyB64)
+        {
+            //check if the keyId exists
+            var keys = objCloudMediaContext.ContentKeys.Where(k => k.Id == "nb:kid:UUID:" + keyId.ToString());
+            if (keys.Count() > 0)
+            {
+                Console.WriteLine("Key Delivery for Key ID = {0} exists.", string.Format("nb:kid:UUID:{0}", keyId.ToString()));
+                return null;
+            }
+
+            byte[] keyValue = Convert.FromBase64String(contentKeyB64);
+
+            var contentKey = objCloudMediaContext.ContentKeys.Create(keyId, keyValue, string.Format("KID_{0}", keyId.ToString()), ContentKeyType.CommonEncryption);
+
+            var restrictions = new List<ContentKeyAuthorizationPolicyRestriction>
+                {
+                    //ContentKeyRestrictionType.Open
+                    //new ContentKeyAuthorizationPolicyRestriction { Requirements = null, 
+                    //                                               Name = "Open", 
+                    //                                               KeyRestrictionType = (int) ContentKeyRestrictionType.Open
+                    //                                             }
+                    
+                    //ContentKeyRestrictionType.IPRestricted,    sample asset: http://willzhanmediaservice.origin.mediaservices.windows.net/394ade06-2d0b-4d5d-9fcc-dca67f9116ae/Anna.ism/Manifest
+                    //new ContentKeyAuthorizationPolicyRestriction { Requirements = string.Format("<Allowed addressType=\"IPv4\"><AddressRange start=\"{0}\" end=\"{0}\" /></Allowed>", "67.186.67.74"), 
+                    //                                               Name = "IPRestricted",                                    
+                    //                                               KeyRestrictionType = (int) ContentKeyRestrictionType.IPRestricted 
+                    //                                             }   
+
+                    //ContentKeyRestrictionType.TokenRestricted, sample asset: http://willzhanmediaservice.origin.mediaservices.windows.net/0bd8e2fd-e508-4eac-b5b8-f10d95cbe9de/BigBuckBunny.ism/manifest
+                    new ContentKeyAuthorizationPolicyRestriction { Requirements = ContentKeyAuthorizationHelper.CreateRestrictionRequirements(),  //(ContentKeyAuthorizationHelper.AccessPolicyTemplateKeyClaim), 
+                                                                   Name = "TokenRestricted", 
+                                                                   KeyRestrictionType = (int) ContentKeyRestrictionType.TokenRestricted
+                                                                 }
+                };
+
+            IContentKeyAuthorizationPolicy contentKeyAuthorizationPolicy = objCloudMediaContext.ContentKeyAuthorizationPolicies.CreateAsync("ContentKeyAuthorizationPolicy").Result;
+
+         
+            //Use License Template API
+            string newLicenseTemplate = CreatePRLicenseResponseTemplate();
+
+            IContentKeyAuthorizationPolicyOption policyOption = objCloudMediaContext.ContentKeyAuthorizationPolicyOptions.Create("Dynamic PlayReady Protection With Token Restriction", ContentKeyDeliveryType.PlayReadyLicense, restrictions, newLicenseTemplate);
+
+            contentKeyAuthorizationPolicy.Options.Add(policyOption);
+
+            // Associate the content key authorization policy with the content key
+            contentKey.AuthorizationPolicyId = contentKeyAuthorizationPolicy.Id;   //or contentKey.AuthorizationPolicy = policy;        
+            contentKey = contentKey.UpdateAsync().Result;
+
+
+            // Update the MediaEncryptor_PlayReadyProtection.xml file with the key and URL info.
+            Uri keyDeliveryServiceUri = contentKey.GetKeyDeliveryUrl(ContentKeyDeliveryType.PlayReadyLicense);
+            Console.WriteLine(string.Format("LAURL = {0}", keyDeliveryServiceUri.OriginalString));
+
+            return contentKey;
+        }
+
+public static string CreateRestrictionRequirements()
+        {
+            string primarySymmetricKey   = System.Configuration.ConfigurationManager.AppSettings["PrimarySymmetricKey"];
+            string secondarySymmetricKey = System.Configuration.ConfigurationManager.AppSettings["SecondarySymmetricKey"];
+            string scope                 = System.Configuration.ConfigurationManager.AppSettings["AcsScope"];
+            string issuer                = System.Configuration.ConfigurationManager.AppSettings["AcsIssuer"];
+
+            TokenRestrictionTemplate objTokenRestrictionTemplate = new TokenRestrictionTemplate();
+
+            objTokenRestrictionTemplate.PrimaryVerificationKey = new SymmetricVerificationKey(Convert.FromBase64String(primarySymmetricKey));
+            objTokenRestrictionTemplate.AlternateVerificationKeys.Add(new SymmetricVerificationKey(Convert.FromBase64String(secondarySymmetricKey)));
+            objTokenRestrictionTemplate.Audience               = new Uri(scope);
+            objTokenRestrictionTemplate.Issuer                 = new Uri(issuer);
+            //objTokenRestrictionTemplate.RequiredClaims.Add(TokenClaim.ContentKeyIdentifierClaim);
+
+            return TokenRestrictionTemplateSerializer.Serialize(objTokenRestrictionTemplate);
+        }
+
+static public void CreateAssetDeliveryPolicy(CloudMediaContext objCloudMediaContext, IAsset objIAsset, IContentKey objIContentKey)
+        {
+            Uri acquisitionUrl = objIContentKey.GetKeyDeliveryUrl(ContentKeyDeliveryType.PlayReadyLicense);
+
+            Dictionary<AssetDeliveryPolicyConfigurationKey, string> assetDeliveryPolicyConfiguration = new Dictionary<AssetDeliveryPolicyConfigurationKey, string>
+            {
+                {AssetDeliveryPolicyConfigurationKey.PlayReadyLicenseAcquisitionUrl, acquisitionUrl.ToString()},
+            };
+
+            var assetDeliveryPolicy = objCloudMediaContext.AssetDeliveryPolicies.Create(
+                    "AssetDeliveryPolicy",
+                    AssetDeliveryPolicyType.DynamicCommonEncryption,
+                    AssetDeliveryProtocol.SmoothStreaming,
+                    assetDeliveryPolicyConfiguration);
+
+            // Add AssetDelivery Policy to the asset
+            objIAsset.DeliveryPolicies.Add(assetDeliveryPolicy);
+
+            Console.WriteLine("Adding Asset Delivery Policy: " + assetDeliveryPolicy.AssetDeliveryPolicyType);
